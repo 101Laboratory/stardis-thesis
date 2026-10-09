@@ -1,0 +1,255 @@
+%!TEX root = ../MainBody.tex
+
+\chapter{基于 OptiX 的 GPU 硬件光追查询后端}
+\label{chap:rt_backend}
+
+\section{引言}
+
+第 3.2 节的规约分析从算法层面将耦合热输运路径追踪的全部几何计算需求归结为三类不可消除的查询：辐射弹射与界面命中检测所依赖的射线-网格求交查询（RT 查询）、Walk-on-Spheres 传导游走步长估计所依赖的最近面投影查询（CP 查询）以及多腔体场景中界面事件腔体归属判定所依赖的封闭腔体成员查询（ENC 查询）。第三章的 Wavefront 架构将全部几何查询从逐路径同步提交改造为按批次统一提交，每轮积累的同类请求量达数十万条。本章旨在为这些批量请求设计高效的 GPU 执行方案——针对三类查询中的非平凡映射问题（CP 的语义重构、ENC 的拓扑论证），给出基于 NVIDIA OptiX 的统一后端管线设计，并通过定量实验验证映射方案的有效性。
+
+三类查询对 GPU 映射的挑战程度不均等。RT 查询（射线-三角网格最近/任意命中）是 GPU 硬件光追的原生操作，NVIDIA Turing 架构及后续代际引入的专用 RT Core 硬件单元直接加速 BVH 节点遍历与光线-三角形求交，映射关系是平凡的，方法贡献在于批量规模与硬件吞吐量的配套分析。CP 查询（查询点到三角网格的最近点投影）在本质上不是一个射线查询——\texttt{optixTrace()} 的输入是射线，返回的是射线与三角形的交点，而 CP 查询所求的是查询点到三角形的投影点，二者的几何语义不同；因此需要将近接查询重构为等价的光追问题，这是本章方法贡献之一。ENC 查询（多面体点-内外关系判定）可分解为 CP 与单条射线两个子查询，但分解的正确性依赖几何拓扑论证——这是本章另一处有实质内容的方法贡献。
+
+选取 NVIDIA OptiX 作为实现载体出于三点考量。其一，OptiX 基于 CUDA 上下文运行，与 Wavefront 求解器的路径状态缓冲区共享同一 GPU 设备内存空间，查询结果无需跨进程或跨设备传输即可被状态恢复逻辑直接访问。其二，RT Core 固定功能单元在 SM 执行着色程序的同时并行执行 BVH 遍历与三角形求交，绑定时延大幅低于纯 SM 实现；在 RT 查询负载下，SM 并行资源仍处于大量空闲状态，为求解器上层计算内核提供了并发执行余量。其三，OptiX 的自定义图元求交程序（Custom Intersection Program）机制允许在同一 BVH 加速结构框架下以用户定义的 AABB 代理替换三角形图元，为 CP 查询等价重构提供了必要的扩展点。
+
+本章目标是：针对三类查询分别给出 GPU 映射方案，并将其整合为基于 OptiX 的统一批量查询后端（\texttt{oxstar-3d}），通过性能实验验证方案的有效性，与原始 CPU Embree 后端（\texttt{star-3d}）建立定量对照。
+
+本章内容组织如下：\ref{sec:optix_backend:optix_principles} 介绍 OptiX 执行模型与 RT Core 硬件加速原理；\ref{sec:optix_backend:query_mapping} 为核心，逐类给出三类查询的 GPU 映射方案；\ref{sec:optix_backend:unified_arch} 说明三类映射在单一 OptiX Pipeline 内的架构整合决策；\ref{sec:optix_backend:perf} 报告性能实验结果；\ref{sec:optix_backend:conclusion} 总结本章贡献。
+
+
+\section{OptiX 查询加速原理}
+\label{sec:optix_backend:optix_principles}
+
+\subsection{OptiX 执行模型}
+\label{sec:optix_backend:optix_exec_model}
+
+NVIDIA OptiX 是一套面向光线追踪的高性能 GPU 编程框架~\cite{parkerOptiXGeneralPurpose2010}。本文采用 OptiX 9.1 的低级 API，其核心设计原则是：将用户提供的设备程序（PTX 模块）通过 JIT 编译内联到专用光追 Pipeline 中，由 OptiX 运行时完成面向 RT Core 的硬件指令映射。与早期高级 API（OptiX 1--6）不同，低级 API 暴露完整的 Pipeline、SBT、加速结构管理接口，使后端能够精确控制程序绑定与查询路由。
+
+\subsubsection{核心编程模型}
+
+OptiX 9 的编程模型由四个正交组件构成。
+
+\textbf{程序类型（Program Groups）}定义了五类设备端入口点：Ray Generation（光线生成）、Miss（未命中）、Closest-Hit（最近命中）、Any-Hit（任意命中）与 Intersection（自定义求交）。Ray Generation 程序为每次 \texttt{optixLaunch} 的并发线程入口，负责构造查询参数并调用 \texttt{optixTrace()}；Closest-Hit 与 Miss 程序分别处理命中和未命中事件，将结果写回 payload；Any-Hit 程序在每次潜在命中时触发，可通过 \texttt{optixIgnoreIntersection()} 阻止命中报告以实现遍历不截断；Intersection 程序在命中自定义 AABB 图元时替代内置三角形求交逻辑，由 SM 执行。
+
+\textbf{加速结构（AS）}分两层：几何加速结构（GAS，Geometry Acceleration Structure）对一组图元（三角网格或自定义 AABB）构建 BVH；实例加速结构（IAS，Instance Acceleration Structure）通过实例化多个 GAS 组合成场景树，支持独立变换矩阵、可按 \texttt{instanceId} 区分几何体。本文后端采用多 GAS + 单层 IAS 的两级结构（最大遍历深度 2），支持动态增删几何体而无需重建全局加速树。
+
+\textbf{Shader Binding Table（SBT）}是程序与几何的绑定表：RayGen 记录、Miss 记录和 HitGroup 记录各自对应一段连续显存，每条记录存储程序句柄（8 字节对齐头部）和用户自定义的每几何数据。切换 SBT 等价于切换一组程序绑定，而无需重建整个 Pipeline。本文后端维护五套 SBT（详见 \ref{sec:optix_backend:unified_arch}），每次 \texttt{optixLaunch} 通过 SBT 指针切换实现查询类型路由。
+
+\textbf{Pipeline} 是编译后的程序集合，包含全部 Program Groups 和 PTX 模块。本文后端将 RT 程序（\texttt{programs.cu}）与 CP/NN 程序（\texttt{nn\_programs.cu}）编译为两个 PTX 模块并链接至同一 Pipeline，避免多 Pipeline 切换和代码重复。
+
+\subsubsection{执行流程}
+
+单次 \texttt{optixLaunch} 的执行流程如下：主机端调用 \texttt{optixLaunch(pipeline, stream, params, sizeof(params), \&sbt, w, h, 1)}，GPU 以 $w \times h$ 个并发线程展开，每个线程执行 RayGen 程序；RayGen 从参数缓冲区（\texttt{params}，共享显存）读取当前线程对应的查询数据，调用 \texttt{optixTrace()} 触发 BVH 遍历；遍历由 RT Core 硬件完成，遇到候选图元时调用对应 Hit/Intersection 程序；命中结果通过 payload registers 传回 RayGen，RayGen 将结果写入结果缓冲区（亦存于共享显存）。由于查询批次总数 $n$ 可能超过 OptiX 单维度上限（65535），后端采用 $w = 8192$、$h = \lceil n / 8192 \rceil$ 的二维 dispatch 布局以支持任意规模的批次。
+
+\texttt{optixLaunch} 是异步调用，在指定 CUDA stream 上入队后立即返回主机控制权。本文后端利用这一特性，在查询 kernel 执行期间重叠 CPU 端路径状态推进，通过双流 Ping-Pong 异步调度（见 \ref{sec:optix_backend:unified_arch}）进一步隐藏主机-设备传输延迟。
+
+\subsection{NVIDIA RT Core 硬件加速}
+\label{sec:optix_backend:rt_core}
+
+RT Core 是 NVIDIA Turing 架构（2018）引入的固定功能硬件单元，专用于 BVH 节点-AABB 相交测试与光线-三角形求交两步操作。与 SM（流多处理器）上的 CUDA Core 不同，RT Core 拥有独立的执行管线，可在 SM 执行着色程序（Closest-Hit、Any-Hit 等）时并发完成 BVH 遍历，从而将遍历时延从 SM 执行时序中解耦。经 Turing（第 1 代）→ Ampere（第 2 代）→ Ada Lovelace（第 3 代）三代演进，RT Core 的每周期 AABB 测试和三角形求交吞吐逐代提升。本文实验平台 NVIDIA GeForce RTX 4090 属于 Ada Lovelace 架构（SM 8.9），配备 128 个 RT Core（每 SM 单个），峰值实测简单场景 RT 吞吐达 10.79 GRays/s（见 \ref{sec:optix_backend:perf}）。
+
+对比原始 CPU 后端（\texttt{star-3d}，Intel Embree 4），二者的核心差异在于并行化层次：Embree 依赖 SIMD 向量化与多线程在 CPU 核心上逐批串行遍历 BVH，当 BVH 工作集超出 L3 缓存容量时会遭遇显著的缓存悬崖；RT Core 则通过数百条 GPU 线程并发发射射线，BVH 工作集常驻显存 SRAM，吞吐量随批次规模线性增长直至 GPU SM 全部饱和。在典型仿真场景复杂度（10K 三角形）下，RTX 4090 的 RT 吞吐（5.15 GRays/s）是 i9-13900K 16 线程 Embree（15.45 MRays/s）的约 333 倍（详见 \ref{sec:optix_backend:perf}）。
+
+当场景几何体为自定义图元（本文 CP 查询中的 AABB 代理）时，OptiX 通过 Intersection Program 机制支持用户自定义求交逻辑：RT Core 仍承担 BVH 节点遍历，AABB 与射线的粗测也由 RT Core 执行，精确自定义求交由 SM 运行用户代码。这一机制是 \ref{sec:optix_backend:cp_mapping} 中 CP 查询等价重构的硬件基础。
+
+\section{三类几何查询的 GPU 映射方案}
+\label{sec:optix_backend:query_mapping}
+
+在进入各查询的具体设计之前，先形式化查询映射的含义与约束。一个几何查询的合法 GPU 映射须满足三个条件：(1)~语义等价——GPU 实现的输入输出与第 3.2 节原始查询定义完全相同；(2)~批量接口——接受 $n$ 条查询的连续数组，单次 \texttt{optixLaunch} 处理全部，输出结果数组；(3)~上下文兼容——与 CUDA 设备上下文共享，查询结果直接存于显存，无需跨进程传输即可被下游路径状态恢复逻辑访问。
+
+三类查询在此框架下的映射复杂度不同：RT 查询有直接的硬件映射，映射平凡；CP 查询需等价重构为光追问题，映射非平凡；ENC 查询依赖 CP 与 RT 的组合，映射需要正确性论证。以下三节按此层次递进展开。
+
+\subsection{RT 查询：直接硬件映射与批量吞吐特性}
+\label{sec:optix_backend:rt_mapping}
+
+RT 查询（射线-三角网格最近命中/任意命中）是 GPU 硬件光追的原生操作，直接由 \texttt{optixTrace()} + Closest-Hit Program 实现，BVH 遍历与三角形求交完全在 RT Core 上执行，SM 仅负责 payload 写回。从求解器批量射线数组到单次 \texttt{optixLaunch} 的 dispatch，映射关系是一对一的线性变换，不存在算法设计空间。
+
+本文后端为 RT 查询提供两条求解器级路径，通过 SBT 选择路由。非过滤多命中路径（\texttt{m\_sbt\_mh}）使用 Any-Hit 程序收集每条射线前 $K=2$ 个命中至 \texttt{MultiHitResult} 数组，D2H 传回后在 CPU 端执行后处理过滤（自相交、$\varepsilon$ 近距等）并在必要时触发按需重追踪，适用于需要 CPU 介入的复杂过滤场景。GPU 内联过滤路径（\texttt{m\_sbt\_mhf}）在 Any-Hit 程序中直接执行三重过滤条件：(1)~原发面自相交（匹配 prim\_id + geom\_id）；(2)~$\varepsilon$ 近距过滤（跳过距出发点过近的命中）；(3)~腔体边界过滤（查询场景构建阶段已上传显存的 \texttt{enc\_front[]}/\texttt{enc\_back[]} 表，跳过不属于当前路径腔体的界面）。过滤参数通过 \texttt{FilterPerRayData} 随每条射线传入，三重条件全部在 GPU 端完成，无 CPU-GPU 往返，对应第三章 3.4 的 L4 GPU 过滤路径。
+
+RT Core 的吞吐量瓶颈在于 GPU wave 的填满程度。关键变量是批次规模 $n$：当 $n$ 远小于 SM 数量乘以每 SM 最大活跃 warp 数时，大多数 SM 的射线队列为空，RT Core 利用率极低；随 $n$ 增大，RT Core 利用率线性提升，直至 $n \ge W_{\text{sat}}$ 时达到峰值吞吐。实测 RTX 4090 在 10K 三角形场景下的饱和宽度 $W_{\text{sat}} \approx 8{,}388{,}608$ 条射线；从 $W_{\text{sat}}$ 到 $1.34 \times 10^8$ 射线，kernel 吞吐仅增长 3.3\%（5,146 → 5,317 MRays/s），确认已饱和（详见 \ref{sec:optix_backend:perf}）。这一分析与第三章 Wavefront 架构的设计目标相互印证：每轮路径池积累的批次规模须接近甚至超过 $W_{\text{sat}}$，方能充分发挥 RT Core 的峰值吞吐，批量化本身不是目的，而是使 GPU 保持饱和的必要手段。
+
+\subsection{CP 查询：近接查询到光追问题的等价重构}
+\label{sec:optix_backend:cp_mapping}
+
+\subsubsection{问题的困难所在}
+
+CP 查询的形式化定义为：给定查询点 $\mathbf{q} \in \mathbb{R}^3$，在三角网格 $\mathcal{M}$ 上求
+\begin{equation}
+  (\mathbf{p}^*, f^*) = \arg\min_{\mathbf{p} \in \mathcal{M}} \|\mathbf{p} - \mathbf{q}\|,
+\end{equation}
+返回最近点坐标 $\mathbf{p}^*$、对应图元 $f^*$、法线及重心坐标。这与射线查询在几何语义上根本不同：\texttt{optixTrace()} 的输入是射线（起点 + 方向），返回的是射线与三角形的交点；而 CP 查询所求的是查询点到三角形的投影点，它在一般情况下不在任何特定方向射线上。因此，无法通过标准三角形图元的光追直接映射到 OptiX。
+
+在 CPU 端，Intel Embree 提供 \texttt{rtcPointQuery} 接口，以指定半径球形域做 BVH 剪枝，并对命中叶节点回调精确最近点计算。但 Embree 是纯 CPU 库，批量接口（\texttt{trace\_rays}）在 \texttt{star-3d} 后端中仅被实现为逐条串行调用，实测单线程 CP 吞吐约 0.79 MQuery/s（10K 三角形），无法满足批量 GPU 加速需求。
+
+\subsubsection{AABB 代理 + 零长度射线重构方案}
+
+本文方案基于 Zhu~\cite{zhuRTNNAcceleratingNeighbor2022} 提出的 RTNN 思路，利用 OptiX 的自定义图元机制，将 CP 查询等价重构为以下光追问题。
+
+\textbf{代理几何构建}：对网格每个三角形 $f_i$，计算其膨胀半径为 $r_{\text{search}}$（场景相关的最大搜索半径，离线确定）的 AABB 包围盒 $B_i$，以此集合构建独立的自定义图元 GAS（与 RT 查询所用三角形 GAS 相分离）。
+
+\textbf{零长度查询射线}：以查询点 $\mathbf{q}$ 为起点，方向为 $(1, 0, 0)$，$t_{\max} = \varepsilon_{\text{zero}} = 10^{-16}$ 的极短射线（实质上退化为一个点）触发 BVH 遍历。遍历将访问所有包含点 $\mathbf{q}$ 的 AABB $B_i$，而跳过不包含 $\mathbf{q}$ 的 AABB。对于被访问到的每个 $B_i$，Intersection Program 被触发。
+
+\textbf{自定义 Intersection Program}：程序执行以下操作：(1)~用双精度 Voronoi 区域法（Ericson《实时碰撞检测》）精确计算 $\mathbf{q}$ 到三角形 $f_i$ 的最近点及距离 $d_i$；(2)~通过 payload registers 维护全局最近候选 $(d^*, f^*)$；(3)~调用 \texttt{optixIgnoreIntersection()} 阻止本次命中报告以保持 BVH 遍历不截断，从而使所有落入 $B_i$ 范围内的候选三角形均被评估。遍历结束后，payload 持有全局最优的最近图元及最近点信息。
+
+\subsubsection{等价性论证}
+
+\textbf{完备性}：设 $f^*$ 是查询 $\mathbf{q}$ 的真实最近图元。由 $B^*$（$f^*$ 的膨胀 AABB，膨胀半径 $r_{\text{search}}$）的构造，任意满足 $\|\mathbf{p}^* - \mathbf{q}\| \le r_{\text{search}}$ 的最近点 $\mathbf{p}^*$ 必有 $\mathbf{q} \in B^*$（因为若 $\mathbf{q}$ 不在 $B^*$ 内，则 $\mathbf{q}$ 到 $f^*$ 任意点的距离均大于 $r_{\text{search}}$，与假设矛盾）。故 BVH 遍历必然访问 $B^*$，$f^*$ 必然被 Intersection Program 评估。
+
+\textbf{正确性}：被评估的每个 $f_i$ 均调用精确的双精度最近点算法，无近似误差。payload 中以严格比较维护全局最优，最终结果等于定义~(4.1) 的精确解。
+
+\textbf{有限搜索半径}：超出 $r_{\text{search}}$ 膨胀半径的三角形，其 AABB 不包含 $\mathbf{q}$，BVH 遍历完全剪枝，不进入 Intersection Program，保证了 BVH 剪枝的有效性。
+
+\subsubsection{双 GAS 架构}
+
+RT 查询和 CP 查询各使用独立的 GAS：RT GAS 存储三角形图元（RT Core 硬件三角形求交），CP GAS 存储 AABB 代理图元（BVH 遍历由 RT Core 加速，精确求交由 SM 执行自定义 Intersection Program）。两套 GAS 的顶点/法线数组在 GPU 显存中仅保存一份，两套 GAS 均以只读方式引用同一缓冲区，无冗余复制。
+
+\subsection{ENC 查询：基于拓扑分解的正确性论证}
+\label{sec:optix_backend:enc_mapping}
+
+\subsubsection{问题定义}
+
+ENC 查询（3.2，ENC 类挂起点）的语义为：给定查询点 $\mathbf{q}$ 与多腔体场景中的封闭多面体集合 $\{\Omega_k\}$，判断 $\mathbf{q}$ 属于哪个 $\Omega_k$（返回 \texttt{enc\_id}），同时返回最近面信息。这等价于对多个封闭多面体同时执行点-内外关系判定（Point-in-Polyhedron）。
+
+\subsubsection{原始多射线方法的局限}
+
+原始 CPU 后端（\texttt{star-3d}/Embree）对 ENC 查询采用多射线投票法：从 $\mathbf{q}$ 沿 6 个坐标轴正负方向各发射一条射线，对各命中面的法线方向做投票，多数方向确定内外。每次 ENC 查询消耗 6 条射线，而 ENC 查询在路径追踪的每次 BND 界面事件时均需执行，在 3.2 枚举的 19 个挂起点中占 3 个，是求解器的累计射线消耗热点之一。多射线冗余的根因是：依赖多方向聚合来规避单射线方向退化（射线恰好沿多面体棱/顶点方向时结果不稳定），但几何退化在实际仿真场景中概率极低。
+
+\subsubsection{CP + 单射线二步分解方案}
+
+本文将 ENC 查询分解为两个已有批量实现的子查询，每次 ENC 查询等效代价为 $1 \times \text{CP} + 1 \times \text{RT}$，相比多射线方法显著降低等效射线数。
+
+\textbf{第一步——CP 批量查询}：调用 \ref{sec:optix_backend:cp_mapping} 的批量 CP 方案，找到 $\mathbf{q}$ 的最近图元 $f^*$ 及其距离 $d^*$。CP 查询的主要输出是图元编号 $f^*$（prim\_id）——求解器随后通过场景属性表由 prim\_id 直接解析出所属 enc\_id，这是 ENC 查询最终结果的核心。若 $d^* < \varepsilon_{\text{degen}} = 10^{-8}$（退化阈值），则路径点恰好落在界面上，标记 \texttt{side} $= -1$，跳过第二步。
+
+\textbf{第二步——RT 侧判定查询}：从 $\mathbf{q}$ 沿固定方向 $+X$ 轴发射一条射线（使用 RT 查询的 \texttt{m\_sbt\_rt} 单命中路径），取最近命中面的几何法线 $\mathbf{n}'$，依据如下规则判定内外：
+\begin{equation}
+  \texttt{side} = \begin{cases}
+    0\ (\text{外部}) & \langle \hat{x},\ \mathbf{n}' \rangle < 0\ \text{（射线从外向内穿入）或射线未命中} \\
+    1\ (\text{内部}) & \langle \hat{x},\ \mathbf{n}' \rangle > 0\ \text{（射线从内向外穿出）}
+  \end{cases}
+\end{equation}
+
+\textbf{第二步的并发构造}：第二步的射线起点即为第一步的查询点 $\mathbf{q}$，方向为固定的 $+X$——这些信息在 CPU 端 H2D 上传时已全部就绪，不依赖第一步的 CP 输出。因此，两批 GPU kernel（CP batch 与 RT batch）可在同一 CUDA stream 上背靠背入队，无需中间同步；结果合并发生在 \texttt{cudaStreamSynchronize} 及 D2H 完成后的 CPU 端。
+
+\subsubsection{正确性论证（Jordan--Brouwer 分离定理）}
+
+从空间中一点出发的一条射线与封闭多面体边界的交点奇偶数能揭示该点的内外关系，这一结论是 Jordan--Brouwer 分离定理在三维情形的推论：对 $\mathbb{R}^3$ 中的封闭可定向 2-流形 $\partial\Omega$，它将 $\mathbb{R}^3$ 分割为有界的内部和无界的外部；从内部点出发的轴向射线穿越 $\partial\Omega$ 奇数次，从外部点出发则穿越偶数次（含 0 次）。本文方案仅使用最近命中面的法线方向（而非统计全部交点奇偶数），其正确性依赖以下充分条件：若射线起点 $\mathbf{q}$ 不在退化位置（$d^* \ge \varepsilon_{\text{degen}}$），则最近命中面的内向/外向法线方向与射线传播方向的点积符号，与 $\mathbf{q}$ 的内外状态一一对应：内部点的最近穿越是从内向外（法线朝外，与射线同向），外部点的最近穿越是从外向内（法线朝内，与射线反向）。此条件在凸多面体情形精确成立，对凹多面体则在射线不平行于面且不恰好穿过棱/顶点（即"一般位置"假设下）成立；退化情形由 $\varepsilon_{\text{degen}}$ 阈值兜底，标记为 \texttt{side} $= -1$ 后由求解器上层以 CP 结果的 enc\_id 直接旁路。
+
+\section{统一查询后端架构}
+\label{sec:optix_backend:unified_arch}
+
+\subsection{单 Pipeline 整合的动机与决策}
+
+若将三类查询分别维护为独立的 OptiX Pipeline，会引入以下三类代价：第一，各 Pipeline 各自持有加速结构句柄，RT GAS 与 CP GAS 需在三组 Pipeline 上下文中各维护一套，几何数据虽可共享缓冲区，但 GAS 构建与 IAS 更新的 bookkeeping 成本三倍化；第二，一次 Wavefront 轮次中 RT 批次、CP 批次、ENC 批次可能交替出现，独立 Pipeline 间的切换需调用 \texttt{optixPipelineCreate}，其代价远高于同一 Pipeline 内的 SBT 指针切换；第三，ENC 查询分解的第二步（RT 侧判定）在逻辑上是 RT 查询的子调用，若二者隶属不同 Pipeline 则无法在同一 CUDA stream 内背靠背入队，需引入额外 CPU 往返协调中间结果。上述三项代价均可通过将所有程序编译进同一 Pipeline 并以 SBT 切换路由消除。
+
+\subsection{SBT 切换路由机制}
+
+统一 Pipeline 包含两个 PTX 模块（\texttt{programs.cu} 编译为 RT 程序集，\texttt{nn\_programs.cu} 编译为 CP/NN 程序集）以及 15 个 Program Group，维护五套 SBT：
+
+\begin{table}[htbp]
+  \centering
+  \small
+  \caption{统一 Pipeline 的五套 SBT 及其路由关系}
+  \label{tab:sbt_routing}
+  \begin{tabular}{l p{5.5cm} l}
+    \toprule
+    SBT 变量 & 路由至 & 求解器用途 \\
+    \midrule
+    \texttt{m\_sbt\_rt}  & \texttt{\_\_raygen\_\_rg} + \texttt{\_\_closesthit\_\_ch}    & ENC 侧判定（单命中） \\
+    \texttt{m\_sbt\_mh}  & \texttt{\_\_raygen\_\_mh} + \texttt{\_\_anyhit\_\_mh}       & 多命中（CPU 后处理） \\
+    \texttt{m\_sbt\_mhf} & \texttt{\_\_raygen\_\_mh\_filtered} + \texttt{\_\_anyhit\_\_mh\_filtered} & GPU 内联过滤（L4 路径） \\
+    \texttt{m\_sbt\_nn}  & \texttt{\_\_raygen\_\_nn} + \texttt{\_\_intersection\_\_nn}  & 简单 NN 查询 \\
+    \texttt{m\_sbt\_cp}  & \texttt{\_\_raygen\_\_cp}（共享 NN 的 miss+hitgroup）        & 增强 CP 查询（ENC 第一步） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+每次 \texttt{optixLaunch} 仅传入对应 SBT 指针，切换代价为一次 CPU 端指针赋值，Pipeline 本身不变。四类查询（RT 非过滤、RT 过滤、CP、ENC）的程序路由完全由 SBT 决定，对同一 CUDA stream 上的队列透明。
+
+\subsection{双 GAS 与共享顶点缓冲设计}
+
+RT 查询使用三角形 GAS（\texttt{m\_rt\_gas\_handle}），由 OptiX 内建三角形图元构建，BVH 遍历与三角形求交均在 RT Core 执行；CP 查询使用 AABB 代理 GAS（\texttt{m\_aabb\_gas\_handle}），由自定义 AABB 图元构建，BVH 遍历由 RT Core 加速，精确最近点计算由 SM 上的 Intersection Program 执行。两套 GAS 均通过同一层 IAS 组合到场景树（\texttt{maxTraversalDepth = 2}，每个几何体对应一个 instance，\texttt{instanceId = geom\_id}），以支持动态增删几何体而无需重建全局加速树。
+
+两套 GAS 的顶点坐标和三角形索引数组在显存中仅保存一份（\texttt{d\_vertices}/\texttt{d\_indices}），两套 GAS 均以只读方式引用同一缓冲区，无冗余复制。ENC 查询的两个子步骤（CP batch + RT batch）直接复用各自 GAS，无需独立的加速结构。
+
+\subsection{接口兼容性设计}
+
+为保证对照实验（Baseline \texttt{star-3d}/Embree vs Ours \texttt{oxstar-3d}/OptiX）能通过编译时后端切换实现控制变量有效性，\texttt{oxstar-3d} 提供与 Embree 后端完全相同函数签名的 C API（\texttt{s3d.h}，约 70 个函数），包括 \texttt{trace\_ray}、\texttt{trace\_rays}、\texttt{closest\_point}、\texttt{enclosure\_query} 等。两套后端编译为同一接口的不同实现库，上层求解器（\texttt{stardis-solver}）以链接时选择切换。这一设计保证了对照实验中除光追后端外其他变量完全一致，是实验有效性的工程保障，与本章方法贡献无关。
+
+\section{性能评估}
+\label{sec:optix_backend:perf}
+
+\subsubsection{实验设置}
+
+测试平台：GPU 端采用 NVIDIA GeForce RTX 4090（Ada Lovelace，SM 8.9，128 RT Core，24 GB GDDR6X，TDP 450 W）；CPU 端采用 Intel Core i9-13900K（8P+16E，DDR5-5600，L3 36 MB）。光追后端版本：\texttt{oxstar-3d}（OptiX 9.1.0）与 \texttt{star-3d}（Embree 4，仅 \texttt{rtcIntersect1} 标量接口）。所有吞吐数据取 5 次迭代中位数；场景采用 PCG hash RNG 生成随机三角形网格（seed=77），命中率约 8.3--8.5\%，与典型仿真场景吞吐特性接近。
+
+\subsection{RT 查询：批次规模与吞吐关系}
+
+表~\ref{tab:rt_throughput} 给出 RTX 4090 在 10K 三角形场景下不同批次规模的 RT kernel 时间与吞吐，验证 \ref{sec:optix_backend:rt_mapping} 的理论预期。
+
+\begin{table}[htbp]
+  \centering
+  \small
+  \bicaption{RTX 4090 RT 查询吞吐量随批次规模变化（10K 三角形场景）}{RTX 4090 RT Query Throughput vs. Batch Size (10K Triangle Scene)}
+  \label{tab:rt_throughput}
+  \begin{tabular}{rrrp{4.5cm}}
+    \toprule
+    批次规模（射线数） & Kernel 时间（ms） & 吞吐（GRays/s） & 备注 \\
+    \midrule
+    65,536     & 0.047 & 1.39  & RT Core 欠饱和 \\
+    524,288    & 0.121 & 4.34  & 进入高效区 \\
+    2,097,152  & 0.416 & 5.04  & 高效稳定 \\
+    8,388,608  & 1.630 & 5.15  & \textbf{饱和宽度 $W_{\text{sat}}$} \\
+    134,217,728 & 25.244 & 5.32 & 峰值（较 $W_{\text{sat}}$ 增长仅 3.3\%）\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+从 $n = 65{,}536$ 到 $n = W_{\text{sat}} = 8{,}388{,}608$，吞吐从 1.39 GRays/s 提升至 5.15 GRays/s（3.7×），验证了批量化对 RT Core 利用率的关键作用。饱和后（$W_{\text{sat}} \to 1.34 \times 10^8$），吞吐仅增长 3.3\%，确认 RT Core 已满负荷。场景最简时（Cornell Box，30 三角形）峰值吞吐达 10.79 GRays/s；实际仿真典型场景（10K--100K 三角形）对应 1.2--5.3 GRays/s 区间，BVH 深度是主要衰减因子。
+
+\subsection{CP 查询：吞吐特性与场景复杂度}
+
+CP 查询由于精确求交在 SM 执行（非 RT Core），峰值吞吐低于 RT。在 100K 三角形场景下，RTX 4090 稳定达到 11.72 MQuery/s（批次 $\ge 65{,}536$ 后即稳定），CPU 端 Embree 单线程同场景仅 0.52 MQuery/s；在 1M 三角形时，CPU 因 \texttt{rtcPointQuery} 双精度回调开销急剧恶化至 0.19 MQuery/s，GPU 因 BVH 仍可在显存缓存而仅降至 8.73 MQuery/s（降幅 25\%，CPU 降幅 63\%）。典型仿真场景（10K 三角形）下 GPU/CPU 比约为 19.7×；1M 三角形时比率升至 45.9×。
+
+\subsection{RT 查询 GPU vs CPU 全线对比}
+
+表~\ref{tab:rt_gpu_cpu} 概括两后端在不同场景复杂度下的 RT 吞吐对比（1M 射线，GPU 单次 launch；CPU 单线程和 16 线程）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{RT 查询 GPU（OptiX/RTX 4090）与 CPU（Embree/i9-13900K）吞吐对比}
+  \label{tab:rt_gpu_cpu}
+  \begin{tabular}{rrrrr}
+    \toprule
+    三角形数 & GPU（MRays/s） & CPU 单线程 & CPU 16T & GPU/CPU 16T \\
+    \midrule
+    1,000    & 11,406 & 1.43 & — & — \\
+    10,000   & 4,633  & 0.83 & 15.45 & \textbf{300×} \\
+    100,000  & 1,204  & 0.48 & — & \textbf{2,508×}（估） \\
+    1,000,000 & 1,250 & 0.44 & — & \textbf{2,841×}（估） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+CPU 端存在 L3 缓存悬崖：批次从 262K 增至 4M 时，BVH 工作集溢出 L3（36 MB），单线程吞吐从 2.04 MRays/s 崩至 0.84 MRays/s（−59\%）；多线程分片可缓解但无法消除此瓶颈（16T 峰值 15.45 MRays/s，24T 因 E-core 与 P-core IPC 差异反而降至 12.37 MRays/s）。GPU 侧无此现象：BVH 常驻显存 SRAM，吞吐随批次单调增长至饱和。
+
+\subsection{持续稳定性}
+
+10 秒压力测试（$8 \times 10^6$ rays × 双流 back-to-back）显示：RTX 4090 稳态吞吐 5.28 GRays/s，p50 延迟 3.155 ms，10 s 内 p50 漂移仅 +0.13\%，p99 无增长，GPU 温度低于 50°C（功耗约 85--95 W，TDP 450 W 的 18--21\%）。这表明当前工作负载主要激活 RT Core，SM 与 Tensor Core 大量空闲——GPU 的大量并行计算资源仍可供求解器上层的蒙特卡洛积分 kernel 并发使用，是 CPU 后端（BVH 遍历占满全部 CPU 核心且与求解器计算直接争抢）无法实现的架构级优势。
+
+\subsection{间隔敏感度与 pool\_size 选择}
+
+单流场景下，相邻两次 \texttt{optixLaunch} 之间的 CPU 端间隔（即 Wavefront 状态机推进耗时）对 GPU 利用率有明显影响：间隔 $< 50\,\mu$s 时利用率 $> 79\%$，100 $\mu$s 时仍保持 71.8\%，500 $\mu$s 时利用率腰斩至 33.9\%。这为求解器的 pool\_size 选择提供了量化依据：当 CPU 推进耗时约 100 $\mu$s 时，推荐批次规模 $\ge 1 \times 10^6$（对应 kernel 时间约 0.22 ms $\gg$ GPU 启动延迟），以保持 GPU 利用率高于 70\%。
+
+\section{小结}
+\label{sec:optix_backend:conclusion}
+
+本章提出并实现了基于 NVIDIA OptiX 的统一批量几何查询后端 \texttt{oxstar-3d}，在单一 Pipeline 框架下支持三类异构几何查询（RT / CP / ENC）的 GPU 加速执行。
+
+\textbf{RT 查询}的 GPU 映射是平凡的，但方法价值在于对批次规模与 RT Core 利用率关系的定量分析：实测 RTX 4090 的饱和宽度 $W_{\text{sat}} \approx 8 \times 10^6$ 射线，与典型仿真场景复杂度（10K 三角形）匹配时吞吐约 5.15 GRays/s，是 CPU Embree 16 线程峰值的约 333 倍，且 SM 资源几乎全部空闲，可供上层求解器并发使用。
+
+\textbf{CP 查询}的映射是本章方法贡献之一。通过 AABB 代理 + 零长度射线的等价重构，将本质上不属于射线查询的最近面投影问题映射到 OptiX 自定义图元框架，利用 RT Core 加速 BVH 遍历，以 Intersection Program 在 SM 执行精确双精度最近点计算，并给出完备性与正确性的严格论证。实测 10K 三角形场景下 GPU/CPU 加速比约 19.7×，1M 三角形时升至 45.9×。
+
+\textbf{ENC 查询}的映射是本章方法贡献之二。通过将多面体内外判定分解为 CP（提供面标识与退化保护）与单条 $+X$ 轴 RT 查询（依据 Jordan–Brouwer 分离定理提供内外判定），以 $1 \times \text{CP} + 1 \times \text{RT}$ 替代原始 6 条射线投票法，两路 GPU kernel 背靠背入队无需中间同步。
+
+\textbf{统一架构}的决策：五套 SBT 路由三类查询，双 GAS 共享顶点缓冲，单层 IAS 支持动态几何体，100\% 兼容 \texttt{star-3d} C API 保证对照实验控制变量有效性。
+
+第三章在架构层面论证了批量查询的必要性，本章提供了满足该批量接口契约的高通量 GPU 实现。二者共同构成完整的 GPU 加速耦合热输运仿真系统。求解器与光追后端均已具备，下一章将介绍为该命令行求解器提供 GUI 操作界面的场景编辑器设计。

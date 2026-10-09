@@ -1,0 +1,74 @@
+%!TEX root = ../MainBody.tex
+
+% 常用符号表
+%% [待办] 以下为模板占位内容，需替换为论文实际符号。
+%%
+%% 建议收录的符号（按类别分组）：
+%%
+%% --- 热物理量 ---
+%%   T         — 温度 [K]
+%%   λ         — 导热系数 [W/(m·K)]
+%%   ρ         — 密度 [kg/m³]
+%%   cₚ        — 比热容 [J/(kg·K)]
+%%   h         — 对流换热系数 [W/(m²·K)]
+%%   ε         — 表面发射率 [-]
+%%   σ         — Stefan-Boltzmann 常数 [W/(m²·K⁴)]
+%%   q         — 热通量 [W/m²]
+%%
+%% --- 辐射传输 ---
+%%   L         — 辐射亮度 [W/(m²·sr)]
+%%   E         — 辐射出射度 [W/m²]
+%%   Ω         — 立体角 [sr]
+%%
+%% --- 蒙特卡洛/路径追踪 ---
+%%   N         — 采样数 / 样本数
+%%   w         — 路径贡献权重
+%%   p(x)      — 概率密度函数
+%%   G(x,x')   — Green 函数
+%%
+%% --- 几何 ---
+%%   x, y, z   — 空间坐标
+%%   n         — 表面法向量
+%%   t         — 射线参数（距离）
+%%   d         — 射线方向向量
+%%
+\chapter{常用符号表}
+\begin{appendix*}
+	\begin{tabular}{p{7em}p{25em}}
+		\multicolumn{2}{l}{\textbf{热物理量}} \\[3pt]
+		$T$, $\theta$   & 温度 [K] \\
+		$\mathbf{q}$     & 热流密度矢量 [W/m\textsuperscript{2}] \\
+		$\lambda$, $k$   & 导热系数 [W/(m$\cdot$K)] \\
+		$\rho$           & 密度 [kg/m\textsuperscript{3}] \\
+		$c_p$            & 比热容 [J/(kg$\cdot$K)] \\
+		$\alpha$         & 热扩散系数 [m\textsuperscript{2}/s]，$\alpha = k/(\rho c_p)$ \\
+		$\dot{S}$        & 体积热源功率密度 [W/m\textsuperscript{3}] \\
+		$h$              & 对流换热系数 [W/(m\textsuperscript{2}$\cdot$K)] \\
+		$\sigma$         & Stefan--Boltzmann 常数 [$5.67 \times 10^{-8}$ W/(m\textsuperscript{2}$\cdot$K\textsuperscript{4})] \\
+		$\varepsilon$    & 表面发射率 [--] \\
+		$h_R$            & 线性化辐射换热系数 [W/(m\textsuperscript{2}$\cdot$K)]，$h_R = 4\sigma\varepsilon\theta_{\mathrm{ref}}^3$ \\[6pt]
+		\multicolumn{2}{l}{\textbf{辐射传输}} \\[3pt]
+		$L(\mathbf{x},\hat{\omega})$ & 辐射亮度 [W/(m\textsuperscript{2}$\cdot$sr)] \\
+		$L_b(T)$         & 黑体辐射亮度 [W/(m\textsuperscript{2}$\cdot$sr)]，$L_b = \sigma T^4/\pi$ \\
+		$L_e$            & 自发辐射亮度 [W/(m\textsuperscript{2}$\cdot$sr)] \\
+		$f_r$            & 双向反射分布函数（BRDF）[sr\textsuperscript{$-1$}] \\
+		$\hat{\omega}$   & 方向单位矢量 [--] \\
+		$\hat{n}$        & 表面法向量 [--] \\
+		$F_{ij}$         & 辐射角系数 [--] \\[6pt]
+		\multicolumn{2}{l}{\textbf{蒙特卡洛与路径追踪}} \\[3pt]
+		$N$              & 采样路径数 \\
+		$\hat{I}_N$      & 蒙特卡洛估计量 \\
+		$p(\mathbf{x})$  & 概率密度函数 \\
+		$W$              & 路径贡献权重 [--] \\
+		$P_{\mathrm{cond}}$ & 界面传导概率 [--] \\
+		$P_{\mathrm{conv}}$ & 界面对流概率 [--] \\
+		$P_{\mathrm{rad}}$  & 界面辐射概率 [--] \\
+		$\delta$         & $\delta$-偏移距离 [m] \\[6pt]
+		\multicolumn{2}{l}{\textbf{几何与光线追踪}} \\[3pt]
+		$\mathbf{r}(t)$  & 射线参数方程，$\mathbf{r}(t) = \mathbf{o} + t\hat{\mathbf{d}}$ \\
+		$\mathbf{o}$     & 射线起点 \\
+		$\hat{\mathbf{d}}$ & 射线方向单位矢量 \\
+		$t$              & 射线参数（距离）\\
+		$d_{\mathrm{wos}}$ & 最近面距离（WoS 步长上界）[m] \\
+	\end{tabular}
+\end{appendix*}
